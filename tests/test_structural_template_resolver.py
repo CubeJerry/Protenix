@@ -2,6 +2,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
+from protenix.data.constants import ATOM37_ORDER, PROTEIN_CHAIN
 from protenix.data.template.structural_template import (
     StructuralTemplateError,
     features_from_template_spec_for_chain,
@@ -9,6 +12,7 @@ from protenix.data.template.structural_template import (
     resolve_task_structural_templates,
 )
 from protenix.data.template.template_featurizer import (
+    TemplateFeatureAssemblyLine,
     get_safe_entity_id_for_template_copy,
 )
 from protenix.data.template.template_utils import TemplateHitFeaturizer
@@ -159,6 +163,123 @@ class TestStructuralTemplateResolver(unittest.TestCase):
         self.assertEqual(set(resolved), {"A", "B"})
         self.assertEqual(len(resolved["A"]), 1)
         self.assertEqual(len(resolved["B"]), 1)
+
+    def test_task_level_multichain_template_preserves_shared_frame(self):
+        pdb_path = self.tmp_path / "shared_frame.pdb"
+        _write_pdb(pdb_path, {"H": list("GGGGGG"), "L": list("GGGGGG")})
+
+        resolved = resolve_task_structural_templates(
+            template_specs=[
+                {
+                    "pdb": str(pdb_path),
+                    "chain_id": ["A", "B"],
+                    "template_id": ["H", "L"],
+                }
+            ],
+            target_chains={"A": "GGGGGG", "B": "GGGGGG"},
+            hit_processor=self.featurizer._hit_processor,
+        )
+
+        feature_a = resolved["A"][0]
+        feature_b = resolved["B"][0]
+        self.assertEqual(
+            feature_a["template_complex_id"],
+            feature_b["template_complex_id"],
+        )
+        self.assertEqual(feature_a["template_target_chain_id"], "A")
+        self.assertEqual(feature_b["template_target_chain_id"], "B")
+
+        ca_idx = ATOM37_ORDER["CA"]
+        distance = np.linalg.norm(
+            feature_a["template_all_atom_positions"][0, ca_idx]
+            - feature_b["template_all_atom_positions"][0, ca_idx]
+        )
+        self.assertAlmostEqual(distance, 50.0, places=4)
+
+    def test_grouped_template_assembly_keeps_cross_chain_features(self):
+        pdb_path = self.tmp_path / "assembly_complex.pdb"
+        _write_pdb(pdb_path, {"H": list("GGGGGG"), "L": list("GGGGGG")})
+        resolved = resolve_task_structural_templates(
+            template_specs=[
+                {
+                    "pdb": str(pdb_path),
+                    "chain_id": ["A", "B"],
+                    "template_id": ["H", "L"],
+                }
+            ],
+            target_chains={"A": "GGGGGG", "B": "GGGGGG"},
+            hit_processor=self.featurizer._hit_processor,
+        )
+        bioassembly = {
+            0: {
+                "entity_id": 0,
+                "chain_id": "A",
+                "sequence": "GGGGGG",
+                "chain_entity_type": PROTEIN_CHAIN,
+                "templates": list(resolved["A"]),
+                "copy_templates": False,
+            },
+            1: {
+                "entity_id": 1,
+                "chain_id": "B",
+                "sequence": "GGGGGG",
+                "chain_entity_type": PROTEIN_CHAIN,
+                "templates": list(resolved["B"]),
+                "copy_templates": False,
+            },
+        }
+
+        features = (
+            TemplateFeatureAssemblyLine(max_templates=4)
+            .assemble(bioassembly, np.arange(12))
+            .as_protenix_dict()
+        )
+
+        pair_mask = features["template_pair_geometry_mask"]
+        self.assertEqual(pair_mask.shape, (4, 12, 12))
+        self.assertEqual(pair_mask[0, 0, 6], 1.0)
+        self.assertEqual(pair_mask[0, 6, 0], 1.0)
+        self.assertEqual(pair_mask[1, 0, 6], 0.0)
+        self.assertEqual(features["template_pseudo_beta_mask"][0, 0, 6], 1.0)
+        self.assertEqual(features["template_distogram"][0, 0, 6].sum(), 1.0)
+
+    def test_independent_task_templates_do_not_emit_pair_geometry_mask(self):
+        pdb_path = self.tmp_path / "independent.pdb"
+        _write_pdb(pdb_path, {"H": list("GGGGGG"), "L": list("GGGGGG")})
+        resolved = resolve_task_structural_templates(
+            template_specs=[
+                {"pdb": str(pdb_path), "chain_id": ["A"], "template_id": ["H"]},
+                {"pdb": str(pdb_path), "chain_id": ["B"], "template_id": ["L"]},
+            ],
+            target_chains={"A": "GGGGGG", "B": "GGGGGG"},
+            hit_processor=self.featurizer._hit_processor,
+        )
+        bioassembly = {
+            0: {
+                "entity_id": 0,
+                "chain_id": "A",
+                "sequence": "GGGGGG",
+                "chain_entity_type": PROTEIN_CHAIN,
+                "templates": list(resolved["A"]),
+                "copy_templates": False,
+            },
+            1: {
+                "entity_id": 1,
+                "chain_id": "B",
+                "sequence": "GGGGGG",
+                "chain_entity_type": PROTEIN_CHAIN,
+                "templates": list(resolved["B"]),
+                "copy_templates": False,
+            },
+        }
+
+        features = (
+            TemplateFeatureAssemblyLine(max_templates=4)
+            .assemble(bioassembly, np.arange(12))
+            .as_protenix_dict()
+        )
+
+        self.assertNotIn("template_pair_geometry_mask", features)
 
     def test_ambiguous_assignment_requires_template_id(self):
         pdb_path = self.tmp_path / "ambiguous.pdb"

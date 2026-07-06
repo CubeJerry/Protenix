@@ -23,10 +23,12 @@ from biotite.structure import AtomArray
 from typing_extensions import Self, TypeAlias
 
 from protenix.data.constants import (
+    ATOM37_NUM,
     DNA_CHAIN,
     LIGAND_CHAIN_TYPES,
     PROTEIN_CHAIN,
     RNA_CHAIN,
+    STD_RESIDUES_WITH_GAP,
 )
 from protenix.data.msa.msa_utils import map_to_standard
 from protenix.data.template.template_parser import HHRParser, HmmsearchA3MParser
@@ -52,6 +54,42 @@ logger = get_logger(__name__)
 
 BatchDict: TypeAlias = dict[str, np.ndarray]
 FeatureDict: TypeAlias = Mapping[str, np.ndarray]
+
+_TEMPLATE_COMPLEX_ID = "template_complex_id"
+_TEMPLATE_PAIR_GEOMETRY_MASK = "template_pair_geometry_mask"
+
+
+def _has_grouped_structural_template(
+    bioassembly: Mapping[int, Mapping[str, Any]],
+) -> bool:
+    return any(
+        template.get(_TEMPLATE_COMPLEX_ID)
+        for info in bioassembly.values()
+        for template in info.get("templates", [])
+    )
+
+
+def _metadata_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _empty_raw_template_features(num_res: int) -> dict[str, Any]:
+    gap = STD_RESIDUES_WITH_GAP["-"]
+    return {
+        "template_aatype": np.full((num_res,), gap, dtype=np.int32),
+        "template_all_atom_masks": np.zeros(
+            (num_res, ATOM37_NUM), dtype=np.float32
+        ),
+        "template_all_atom_positions": np.zeros(
+            (num_res, ATOM37_NUM, 3), dtype=np.float32
+        ),
+        "template_domain_names": np.array(b"", dtype=object),
+        "template_release_date": np.array(b"1970-01-01", dtype=object),
+        "template_sequence": np.array(("-" * num_res).encode(), dtype=object),
+    }
 
 
 class TemplateSourceManager:
@@ -141,6 +179,12 @@ class TemplateFeatureAssemblyLine:
         Returns:
             An assembled Templates object.
         """
+        if _has_grouped_structural_template(bioassembly):
+            return self._assemble_with_grouped_structural_templates(
+                bioassembly=bioassembly,
+                standard_token_idxs=standard_token_idxs,
+            )
+
         np_chains_list = []
         polymer_entity_features = {True: {}, False: {}}
         # Identify entities where template features can be safely copied (same sequence)
@@ -218,6 +262,157 @@ class TemplateFeatureAssemblyLine:
             atom_positions=merged_example["template_atom_positions"],
             atom_mask=merged_example["template_atom_mask"].astype(bool),
         )
+
+    def _assemble_with_grouped_structural_templates(
+        self,
+        bioassembly: Mapping[int, Mapping[str, Any]],
+        standard_token_idxs: np.ndarray,
+    ) -> "Templates":
+        chain_items = list(bioassembly.items())
+        complex_records: dict[str, dict[str, Any]] = {}
+
+        for asym_id, info in chain_items:
+            for template in info.get("templates", []):
+                complex_id = template.get(_TEMPLATE_COMPLEX_ID)
+                if not complex_id:
+                    continue
+                record = complex_records.setdefault(
+                    str(complex_id),
+                    {
+                        "slot": _metadata_int(template.get("template_complex_slot")),
+                        "source_index": _metadata_int(
+                            template.get("template_source_index")
+                        ),
+                        "source_name": str(template.get("template_source_name", "")),
+                        "members": {},
+                    },
+                )
+                record["members"][asym_id] = template
+
+        ordered_complex_ids = sorted(
+            complex_records,
+            key=lambda complex_id: (
+                complex_records[complex_id]["slot"],
+                complex_records[complex_id]["source_index"],
+                complex_records[complex_id]["source_name"],
+                complex_id,
+            ),
+        )
+        complex_slot_by_id = {
+            complex_id: slot
+            for slot, complex_id in enumerate(
+                ordered_complex_ids[: self.max_templates]
+            )
+        }
+        reserved_slots = set(complex_slot_by_id.values())
+        per_chain_slots = {
+            asym_id: [None] * self.max_templates for asym_id, _ in chain_items
+        }
+        slot_participants: dict[int, set[int]] = {}
+
+        for complex_id, slot in complex_slot_by_id.items():
+            members = complex_records[complex_id]["members"]
+            slot_participants[slot] = set(members)
+            for asym_id, template in members.items():
+                per_chain_slots[asym_id][slot] = template
+
+        for asym_id, info in chain_items:
+            next_slot = 0
+            for template in info.get("templates", []):
+                if template.get(_TEMPLATE_COMPLEX_ID):
+                    continue
+                while (
+                    next_slot < self.max_templates
+                    and (
+                        next_slot in reserved_slots
+                        or per_chain_slots[asym_id][next_slot] is not None
+                    )
+                ):
+                    next_slot += 1
+                if next_slot >= self.max_templates:
+                    break
+                per_chain_slots[asym_id][next_slot] = template
+                next_slot += 1
+
+        np_chains_list = []
+        chain_ranges: dict[int, tuple[int, int]] = {}
+        offset = 0
+        for asym_id, info in chain_items:
+            chain_type = info["chain_entity_type"]
+            num_tokens = len(info["sequence"])
+            skip_chain = chain_type != PROTEIN_CHAIN or num_tokens <= 4
+
+            raw_templates = [
+                _empty_raw_template_features(num_tokens)
+                if skip_chain or template is None
+                else template
+                for template in per_chain_slots[asym_id]
+            ]
+            template_features = TemplateFeatures.package_template_features(
+                hit_features=raw_templates
+            )
+            template_features = TemplateFeatures.fix_template_features(
+                template_features=template_features,
+                num_res=num_tokens,
+            )
+            np_chains_list.append(dict(template_features))
+            chain_ranges[asym_id] = (offset, offset + num_tokens)
+            offset += num_tokens
+
+        merged_example = {
+            ft: np.concatenate([c[ft] for c in np_chains_list], axis=1)
+            for ft in TEMPLATE_FEATURES
+        }
+        pair_geometry_mask = self._build_template_pair_geometry_mask(
+            chain_ranges=chain_ranges,
+            slot_participants=slot_participants,
+        )
+
+        standard_token_idxs = np.asarray(standard_token_idxs, dtype=np.int64)
+        for feature_name, v in merged_example.items():
+            merged_example[feature_name] = v[
+                : self.max_templates, standard_token_idxs, ...
+            ]
+        pair_geometry_mask = pair_geometry_mask[
+            : self.max_templates, standard_token_idxs, :
+        ][:, :, standard_token_idxs]
+
+        return Templates(
+            aatype=merged_example["template_aatype"],
+            atom_positions=merged_example["template_atom_positions"],
+            atom_mask=merged_example["template_atom_mask"].astype(bool),
+            pair_geometry_mask=pair_geometry_mask,
+        )
+
+    def _build_template_pair_geometry_mask(
+        self,
+        *,
+        chain_ranges: Mapping[int, tuple[int, int]],
+        slot_participants: Mapping[int, set[int]],
+    ) -> np.ndarray:
+        total_res = max((end for _, end in chain_ranges.values()), default=0)
+        pair_mask = np.zeros(
+            (self.max_templates, total_res, total_res), dtype=np.float32
+        )
+
+        for template_slot in range(self.max_templates):
+            participants = slot_participants.get(template_slot)
+            if participants is None:
+                for start, end in chain_ranges.values():
+                    pair_mask[template_slot, start:end, start:end] = 1.0
+                continue
+
+            for asym_i in participants:
+                if asym_i not in chain_ranges:
+                    continue
+                start_i, end_i = chain_ranges[asym_i]
+                for asym_j in participants:
+                    if asym_j not in chain_ranges:
+                        continue
+                    start_j, end_j = chain_ranges[asym_j]
+                    pair_mask[template_slot, start_i:end_i, start_j:end_j] = 1.0
+
+        return pair_mask
 
 
 class TemplateFeaturizer:
@@ -566,6 +761,8 @@ class Templates:
     atom_positions: np.ndarray
     # atom_mask: [num_templates, num_res, 24]
     atom_mask: np.ndarray
+    # pair_geometry_mask: [num_templates, num_res, num_res]
+    pair_geometry_mask: Optional[np.ndarray] = None
 
     @classmethod
     def from_data_dict(cls, batch: BatchDict) -> Self:
@@ -574,15 +771,21 @@ class Templates:
             aatype=batch["template_aatype"],
             atom_positions=batch["template_atom_positions"],
             atom_mask=batch["template_atom_mask"],
+            pair_geometry_mask=batch.get(_TEMPLATE_PAIR_GEOMETRY_MASK),
         )
 
     def as_data_dict(self) -> BatchDict:
         """Convert to a standard data dictionary."""
-        return {
+        features = {
             "template_aatype": self.aatype,
             "template_atom_positions": self.atom_positions,
             "template_atom_mask": self.atom_mask,
         }
+        if self.pair_geometry_mask is not None:
+            features[_TEMPLATE_PAIR_GEOMETRY_MASK] = self.pair_geometry_mask.astype(
+                np.float32
+            )
+        return features
 
     # Shared config instance to avoid repeated object creation
     _DGRAM_CONFIG = DistogramFeaturesConfig(

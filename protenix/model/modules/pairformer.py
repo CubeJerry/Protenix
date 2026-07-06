@@ -1011,6 +1011,13 @@ class TemplateEmbedder(nn.Module):
             return 0
         asym_id = input_feature_dict["asym_id"]
         multichain_mask = (asym_id[:, None] == asym_id[None, :]).to(z.dtype)
+        template_pair_geometry_mask = input_feature_dict.get(
+            "template_pair_geometry_mask"
+        )
+        if template_pair_geometry_mask is not None:
+            template_pair_geometry_mask = template_pair_geometry_mask.to(
+                dtype=z.dtype, device=z.device
+            )
 
         num_residues = z.shape[0]
         # determine whether the number of templates is the configured maximum value, otherwise error out
@@ -1023,12 +1030,17 @@ class TemplateEmbedder(nn.Module):
         z = self.layernorm_z(z)
         u = 0
         for template_id in range(num_templates):
+            template_pair_mask = (
+                template_pair_geometry_mask[template_id]
+                if template_pair_geometry_mask is not None
+                else multichain_mask
+            )
             u = u + self.single_template_forward(
                 template_id=template_id,
                 input_feature_dict=input_feature_dict,
                 z=z,
                 pair_mask=pair_mask,
-                multichain_mask=multichain_mask,
+                template_pair_mask=template_pair_mask,
                 triangle_attention=triangle_attention,
                 triangle_multiplicative=triangle_multiplicative,
                 inplace_safe=inplace_safe,
@@ -1045,13 +1057,15 @@ class TemplateEmbedder(nn.Module):
         input_feature_dict: dict[str, Any],
         z: torch.Tensor,
         pair_mask: Optional[torch.Tensor] = None,
-        multichain_mask: Optional[torch.Tensor] = None,
+        template_pair_mask: Optional[torch.Tensor] = None,
         triangle_attention: str = "torch",
         triangle_multiplicative: str = "torch",
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         to_concat = []
+        if template_pair_mask is None:
+            template_pair_mask = z.new_ones(z.shape[:-1])
 
         dgram = input_feature_dict["template_distogram"][
             template_id
@@ -1059,9 +1073,9 @@ class TemplateEmbedder(nn.Module):
         pseudo_beta_mask_2d = input_feature_dict["template_pseudo_beta_mask"][
             template_id
         ]
-        dgram = dgram * multichain_mask[..., None] * pair_mask[..., None]
+        dgram = dgram * template_pair_mask[..., None] * pair_mask[..., None]
         pseudo_beta_mask_2d = (
-            pseudo_beta_mask_2d * multichain_mask * pair_mask
+            pseudo_beta_mask_2d * template_pair_mask * pair_mask
         )  # [N_token, N_token]
         to_concat.append(dgram)
         to_concat.append(pseudo_beta_mask_2d.unsqueeze(-1))
@@ -1073,14 +1087,14 @@ class TemplateEmbedder(nn.Module):
 
         unit_vector = input_feature_dict["template_unit_vector"][template_id]
         unit_vector = (
-            unit_vector * multichain_mask[..., None] * pair_mask[..., None]
+            unit_vector * template_pair_mask[..., None] * pair_mask[..., None]
         )  # [N_token, N_token, 3]
         to_concat.append(unit_vector)
 
         backbone_mask_2d = input_feature_dict["template_backbone_frame_mask"][
             template_id
         ]
-        backbone_mask_2d = backbone_mask_2d * multichain_mask * pair_mask
+        backbone_mask_2d = backbone_mask_2d * template_pair_mask * pair_mask
         to_concat.append(backbone_mask_2d.unsqueeze(-1))
 
         at = torch.concat(to_concat, dim=-1)

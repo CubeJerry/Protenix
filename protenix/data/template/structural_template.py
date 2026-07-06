@@ -328,8 +328,11 @@ def _extract_chain_features(
     template_chain_id: str,
     mapping: Mapping[int, int],
     feature_index: int,
+    zero_center: Optional[bool] = None,
 ) -> StructuralTemplateFeatures:
     template_sequence = mmcif_object.chain_to_seqres[template_chain_id]
+    if zero_center is None:
+        zero_center = hit_processor._zero_center_positions  # noqa: SLF001
     features, warning = hit_processor._extract_template_features(  # noqa: SLF001
         mmcif_object,
         template_name,
@@ -337,7 +340,7 @@ def _extract_chain_features(
         template_sequence,
         query_sequence,
         template_chain_id,
-        hit_processor._zero_center_positions,  # noqa: SLF001
+        zero_center,
     )
 
     release_date = mmcif_object.header.get("release_date") or "9999-12-31"
@@ -365,6 +368,29 @@ def _extract_chain_features(
         hit=hit,
         warnings=tuple(warnings),
     )
+
+
+def _center_grouped_template_features(
+    features_list: Sequence[Mapping[str, Any]],
+) -> None:
+    """Apply one centering transform across all chains in a grouped template."""
+
+    valid_positions = []
+    for features in features_list:
+        mask = features["template_all_atom_masks"].astype(bool)
+        if np.any(mask):
+            valid_positions.append(features["template_all_atom_positions"][mask])
+
+    if not valid_positions:
+        return
+
+    center = np.concatenate(valid_positions, axis=0).mean(axis=0)
+    for features in features_list:
+        mask = features["template_all_atom_masks"].astype(bool)
+        if np.any(mask):
+            positions = features["template_all_atom_positions"].copy()
+            positions[mask] -= center
+            features["template_all_atom_positions"] = positions
 
 
 def features_from_template_spec_for_chain(
@@ -563,6 +589,7 @@ def resolve_task_structural_templates(
                 "chain pair per template entry."
             )
 
+        resolved_features = []
         for target_chain_id, template_chain_id in chain_pairs:
             query_sequence = target_chains[target_chain_id]
             template_sequence = mmcif_object.chain_to_seqres[template_chain_id]
@@ -582,6 +609,11 @@ def resolve_task_structural_templates(
                     query_sequence, template_sequence
                 )
 
+            zero_center = (
+                hit_processor._zero_center_positions  # noqa: SLF001
+                if len(chain_pairs) == 1
+                else False
+            )
             features = _extract_chain_features(
                 hit_processor=hit_processor,
                 mmcif_object=mmcif_object,
@@ -590,8 +622,33 @@ def resolve_task_structural_templates(
                 template_chain_id=template_chain_id,
                 mapping=mapping,
                 feature_index=template_index,
+                zero_center=zero_center,
             )
-            resolved[target_chain_id].append(features.features)
+            if len(chain_pairs) > 1:
+                complex_id = (
+                    f"{template_index}:{template_name}:"
+                    f"{','.join(f'{target}:{template}' for target, template in chain_pairs)}"
+                )
+                features.features.update(
+                    {
+                        "template_source_kind": "task_structural",
+                        "template_source_name": template_name,
+                        "template_source_index": template_index,
+                        "template_complex_id": complex_id,
+                        "template_complex_slot": template_index,
+                        "template_target_chain_id": target_chain_id,
+                        "template_chain_id": template_chain_id,
+                    }
+                )
+            resolved_features.append((target_chain_id, features.features))
+
+        if len(chain_pairs) > 1:
+            _center_grouped_template_features(
+                [features for _, features in resolved_features]
+            )
+
+        for target_chain_id, features in resolved_features:
+            resolved[target_chain_id].append(features)
 
     return dict(resolved)
 
