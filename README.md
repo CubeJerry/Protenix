@@ -105,8 +105,12 @@ features.
 ```bash
 git clone https://github.com/cytokineking/Protenix.git
 cd Protenix
-pip install -e .
+pip install -e ".[cu12]"
 ```
+
+Use `pip install -e ".[cu13]"` with a CUDA 13 PyTorch runtime. The CUDA-specific
+cuEquivariance operators are extras so image builders can select one backend
+without installing libraries for both CUDA major versions.
 
 For `protenix score`, also install and configure the optional
 [`protenixscore`](https://github.com/cytokineking/ProtenixScore) package.

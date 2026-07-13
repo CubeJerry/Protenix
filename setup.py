@@ -67,6 +67,10 @@ setup(
         "protenix": ["model/layer_norm/kernel/*"],
     },
     install_requires=install_requires,
+    extras_require={
+        "cu12": ["cuequivariance-ops-torch-cu12==0.10.0"],
+        "cu13": ["cuequivariance-ops-torch-cu13==0.10.0"],
+    },
     license="Apache 2.0 License",
     platforms="manylinux1",
     entry_points={
