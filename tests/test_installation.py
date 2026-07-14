@@ -23,6 +23,7 @@ Related to GitHub issues #182 (pip install error)
 import importlib.util
 import sys
 import unittest
+from pathlib import Path
 
 
 class TestInstallation(unittest.TestCase):
@@ -34,6 +35,20 @@ class TestInstallation(unittest.TestCase):
         self.assertGreaterEqual(version_info.major, 3)
         self.assertGreaterEqual(
             version_info.minor, 11, "Protenix requires Python 3.11 or higher"
+        )
+
+    def test_cuda_accelerators_are_backend_specific_extras(self):
+        root = Path(__file__).resolve().parents[1]
+        requirements = (root / "requirements.txt").read_text()
+        setup_py = (root / "setup.py").read_text()
+
+        self.assertNotIn("cuequivariance-ops-torch-cu12", requirements)
+        self.assertNotIn("cuequivariance-ops-torch-cu13", requirements)
+        self.assertIn(
+            '"cu12": ["cuequivariance-ops-torch-cu12==0.10.0"]', setup_py
+        )
+        self.assertIn(
+            '"cu13": ["cuequivariance-ops-torch-cu13==0.10.0"]', setup_py
         )
 
     def test_deepspeed_pydantic_compatibility(self):
