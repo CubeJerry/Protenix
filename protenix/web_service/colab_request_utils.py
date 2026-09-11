@@ -80,7 +80,7 @@ def run_mmseqs2_service(
                 res = requests.post(
                     f"{host_url}/{submission_endpoint}",
                     data={"q": query, "mode": mode, "email": email},
-                    timeout=6.02,
+                    timeout=60,
                     headers=headers,
                     auth=HTTPBasicAuth(username, password),
                 )
@@ -145,7 +145,7 @@ def run_mmseqs2_service(
             try:
                 res = requests.get(
                     f"{host_url}/result/download/{ID}",
-                    timeout=6.02,
+                    timeout=60,
                     headers=headers,
                     auth=HTTPBasicAuth(username, password),
                 )
