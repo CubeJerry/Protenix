@@ -201,7 +201,10 @@ class ConfidenceHead(nn.Module):
         z_trunk = z_init + z_trunk
         if not self.training:
             del z_init
-            torch.cuda.empty_cache()
+            # Reuse allocator blocks for normal-sized inference. Keep the
+            # existing release policy for the large-input CPU-offload path.
+            if z_trunk.shape[-2] > 2000:
+                torch.cuda.empty_cache()
 
         plddt_preds, pae_preds, pde_preds, resolved_preds = (
             [],

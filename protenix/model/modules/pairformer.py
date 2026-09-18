@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from protenix.data.constants import STD_RESIDUES_WITH_GAP
+from protenix.model.inference_optimization import enabled
 from protenix.model.modules.primitives import LinearNoBias, Transition
 from protenix.model.modules.transformer import AttentionPairBias
 from protenix.model.modules.fused_ops import dropout_add_rowwise
@@ -382,13 +383,17 @@ class MSAPairWeightedAveraging(nn.Module):
             initializer="zeros",
         )
 
-    def forward(self, m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, m: torch.Tensor, z: torch.Tensor, pair_weights: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
             m (torch.Tensor): msa embedding
                 [...,n_msa_sampled, n_token, c_m]
             z (torch.Tensor): pair embedding
                 [...,n_token, n_token, c_z]
+            pair_weights (torch.Tensor, optional): precomputed softmax weights
+                for this exact z and module, scoped to one inference call.
         Returns:
             torch.Tensor: updated msa embedding
                 [...,n_msa_sampled, n_token, c_m]
@@ -399,16 +404,18 @@ class MSAPairWeightedAveraging(nn.Module):
         v = v.reshape(
             *v.shape[:-1], self.n_heads, self.c
         )  # [...,n_msa_sampled, n_token, n_heads, c]
-        b = self.linear_no_bias_z(
-            self.layernorm_z(z)
-        )  # [...,n_token, n_token, n_heads]
+        b = None
+        if pair_weights is None:
+            b = self.linear_no_bias_z(
+                self.layernorm_z(z)
+            )  # [...,n_token, n_token, n_heads]
         g = torch.sigmoid(
             self.linear_no_bias_mg(m)
         )  # [...,n_msa_sampled, n_token, n_heads * c]
         g = g.reshape(
             *g.shape[:-1], self.n_heads, self.c
         )  # [...,n_msa_sampled, n_token, n_heads, c]
-        w = self.softmax_w(b)  # [...,n_token, n_token, n_heads]
+        w = self.softmax_w(b) if pair_weights is None else pair_weights
         wv = torch.einsum(
             "...ijh,...mjhc->...mihc", w, v
         )  # [...,n_msa_sampled,n_token,n_heads,c]
@@ -561,12 +568,21 @@ class MSAStack(nn.Module):
         """
         num_msa = m.shape[-3]
         no_chunks = num_msa // chunk_size + (num_msa % chunk_size != 0)
+        pair_weights = None
+        if (
+            no_chunks > 1
+            and not self.training
+            and not torch.is_grad_enabled()
+            and enabled("PROTENIX_REUSE_MSA_PAIR_WEIGHTS")
+        ):
+            pwa = self.msa_pair_weighted_averaging
+            pair_weights = pwa.softmax_w(pwa.linear_no_bias_z(pwa.layernorm_z(z)))
         for i in range(no_chunks):
             start = i * chunk_size
             end = min((i + 1) * chunk_size, num_msa)
             # Use inplace to save memory
             m[start:end, :, :] += self.msa_pair_weighted_averaging(
-                m[start:end, :, :], z
+                m[start:end, :, :], z, pair_weights=pair_weights
             )
             m[start:end, :, :] += self.transition_m(m[start:end, :, :])
         return m
@@ -1029,13 +1045,55 @@ class TemplateEmbedder(nn.Module):
 
         z = self.layernorm_z(z)
         u = 0
-        for template_id in range(num_templates):
+        # Local to this call: z changes between recycles and candidates. Include
+        # the fork's per-template geometry mask when identifying duplicates.
+        reuse = (
+            not self.training
+            and not torch.is_grad_enabled()
+            and enabled("PROTENIX_REUSE_TEMPLATES")
+        )
+        template_keys = (
+            "template_aatype",
+            "template_distogram",
+            "template_pseudo_beta_mask",
+            "template_unit_vector",
+            "template_backbone_frame_mask",
+        )
+        if template_pair_geometry_mask is not None:
+            template_keys += ("template_pair_geometry_mask",)
+        representatives = list(range(num_templates))
+        if reuse:
+            for template_id in range(num_templates):
+                for previous in range(template_id):
+                    if representatives[previous] != previous:
+                        continue
+                    if all(
+                        torch.equal(
+                            input_feature_dict[key][template_id],
+                            input_feature_dict[key][previous],
+                        )
+                        for key in template_keys
+                    ):
+                        representatives[template_id] = previous
+                        break
+        # Retain only outputs with future duplicate consumers; unique templates
+        # have the same memory lifetime as the original implementation.
+        last_use = {
+            representative: i for i, representative in enumerate(representatives)
+        }
+        cached = {}
+        for template_id, representative in enumerate(representatives):
+            if representative in cached:
+                u = u + cached[representative]
+                if last_use[representative] == template_id:
+                    del cached[representative]
+                continue
             template_pair_mask = (
                 template_pair_geometry_mask[template_id]
                 if template_pair_geometry_mask is not None
                 else multichain_mask
             )
-            u = u + self.single_template_forward(
+            value = self.single_template_forward(
                 template_id=template_id,
                 input_feature_dict=input_feature_dict,
                 z=z,
@@ -1046,6 +1104,11 @@ class TemplateEmbedder(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+            if last_use[template_id] > template_id:
+                cached[template_id] = value
+            # Preserve the original addition order, including duplicate slots.
+            u = u + value
+            del value
         u = u / (1e-7 + num_templates)
         u = self.linear_no_bias_u(self.relu(u))
         assert u.shape == (num_residues, num_residues, query_num_channels)

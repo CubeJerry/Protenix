@@ -34,6 +34,7 @@ from protenix.config.config import parse_configs, parse_sys_args
 from protenix.data.inference.infer_dataloader import get_inference_dataloader
 from protenix.model.layernorm_selector import resolve_layernorm_type
 from protenix.model.protenix import Protenix
+from protenix.model.inference_optimization import checkpoint_initialization, enabled
 from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.seed import seed_everything
 from protenix.utils.torch_utils import to_device
@@ -145,7 +146,21 @@ class InferenceRunner(object):
         """
         Initialize the Protenix model and move it to the appropriate device.
         """
-        self.model = Protenix(self.configs).to(self.device)
+        flags = (
+            "PROTENIX_SKIP_RANDOM_INIT",
+            "PROTENIX_REUSE_TEMPLATES",
+            "PROTENIX_REUSE_MSA_PAIR_WEIGHTS",
+        )
+        active = {flag: enabled(flag) for flag in flags}
+        self.print(
+            "Inference work reuse: "
+            + ", ".join(f"{flag}={int(value)}" for flag, value in active.items())
+        )
+        skip = active["PROTENIX_SKIP_RANDOM_INIT"]
+        with checkpoint_initialization(skip, self.configs.load_strict):
+            self.model = Protenix(self.configs).to(self.device)
+        if skip:
+            self.print("PROTENIX_SKIP_RANDOM_INIT=1: strict checkpoint load follows")
 
     def load_checkpoint(self) -> None:
         """
@@ -497,6 +512,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         t1_start = time.time()
         for batch in dataloader:
             sample_name = "unknown"
+            prediction = None
             try:
                 t2_start = time.time()
                 data, atom_array, data_error_message = batch[0]
@@ -533,6 +549,9 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         if v != "non-polymer"
                     },
                 )
+                # The synchronous dumper has finished; do not retain GPU outputs
+                # through the next seed/item's forward pass.
+                del prediction
                 t2_end = time.time()
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample_name} [seed:{seed}] succeeded. "
@@ -552,6 +571,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     encoding="utf-8",
                 ) as f:
                     f.write(error_message)
+                prediction = None
                 torch.cuda.empty_cache()
         t1_end = time.time()
         logger.info(
