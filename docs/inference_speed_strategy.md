@@ -1,5 +1,21 @@
 # Protenix-v2 inference speed strategy
 
+## Implementation status — 18 September 2026
+
+| Stage | Implementation | Validation and release status |
+|---|---|---|
+| 1. Memory/allocator overhead | Implemented in the fork | 3 CPU regressions passed; GPU memory/runtime checks pending |
+| 2. Startup and repeated preparation | All four changes implemented across fork and pipeline | 6 model CPU tests and 5 pipeline shell tests passed; new optimizations remain opt-in |
+| 3. Exact execution integration | Planned | Begin after stages 1–2 are validated on target GPUs |
+| 4. Fast execution evaluation | Planned | Requires separate application-specific accuracy assessment |
+
+Implementation is available in [Protenix PR #1](https://github.com/CubeJerry/Protenix/pull/1)
+and [pipeline PR #122](https://github.com/CubeJerry/dev/pull/122), both published
+as drafts. The implementation revisions are fork
+`a3b3a3e28783896ad9f9ee17b2cf8fc484405891` and pipeline
+`8fc6a29e7586e3ce5832dc5ba2ad023c5bb6ccf9`. This status records implementation
+and CPU checks, not deployment or measured folding acceleration.
+
 ## Objective and evidence
 
 Increase throughput on the pipeline's A30/A100 workers while preserving sampling
@@ -48,12 +64,12 @@ These checks establish control-flow behaviour, not numerical/GPU equivalence.
 
 ## Stage 2: remove startup and repeated preparation costs
 
-| Work | Implementation boundary | Verification |
+| Implemented change | Completed verification | Remaining target-system verification |
 |---|---|---|
-| Reuse compiled kernels | Pipeline SLURM template/runtime; preserve explicit cache overrides | Cold/warm timing, concurrent jobs, read-only/full-cache cases |
-| Skip overwritten random initialization | Fork runner model construction, only with strict checkpoint loading | All loaded parameters and buffers match; seed reset occurs before stochastic featurization/inference |
-| Reuse identical template calculations | Template embedder, scoped to one call and current pair representation | Compare complete feature slices; preserve addition order and all chain mappings |
-| Reuse MSA pair weights across chunks | MSA block, only while its pair input remains unchanged | First establish that actual VHH MSA depth spans chunks; test output equality |
+| Persistent native Triton/CUDA caches in the SLURM template | Default/override paths, cross-job reuse of paths, namespace separation, unavailable-path fallback and invalid namespaces | Actual cache hits, cold/warm timing, concurrent writes and full-cache behavior |
+| Skip overwritten random linear initialization with strict loading | Representative linear checkpoint equality, constant buffers, strict-load rejection and isolated initialization scope | Full Protenix-v2 checkpoint parameters/buffers and seeded end-to-end outputs |
+| Reuse identical template calculations within one call | Bitwise CPU output equality, fewer calls, distinct features/geometry masks, changed pair inputs and training/gradient guards | GPU equivalence, duplicate frequency, equality-check overhead and memory |
+| Reuse MSA pair weights across chunks within one call | Bitwise CPU output equality, fewer projections, partial final chunks, changed pair inputs and single-chunk/training behavior | GPU equivalence and memory; confirm production VHH MSAs span multiple chunks |
 
 Stage 2 is implemented behind independent opt-in switches (all default to `0`):
 
@@ -213,6 +229,27 @@ for throughput of many independent nanobody complexes.
    checks pass, memory/failure rates remain acceptable and net workload speed
    improves. Keep the original image available for rollback and record execution
    mode in run provenance so recovery cannot silently mix implementations.
+
+## Next work when cluster access returns
+
+1. Build or repin the Protenix component image to the implemented fork revision;
+   update the pipeline and regenerate its job scripts. Confirm the imported source
+   and logged switches. Keep all stage-2 switches off for the initial control.
+2. Compare the pre-stage-1 fork with stage 1, then enable each stage-2 change
+   individually before testing their combination. Keep checkpoint, inputs,
+   precision and sampling budget fixed throughout.
+3. Validate full-checkpoint loading and seeded coordinates/confidence outputs on
+   A30 and A100. Include duplicate and distinct templates, per-template geometry
+   masks, shallow/deep MSAs and consecutive distinct candidates.
+4. Prewarm one persistent-cache job, then check warm reuse and concurrent jobs on
+   the actual filesystem. Record startup, total runtime and peak memory alongside
+   numerical comparisons using the benchmark protocol above.
+5. Enable only changes that pass those checks and improve the real workload.
+   Leave ineffective switches off. Proceed to stage 3 once this baseline is stable.
+
+While the login node is unavailable, no GPU timing or full-folding results are
+claimed. The 14 passing CPU tests comprise 3 stage-1, 6 stage-2 model and 5 pipeline
+tests; they are not 14 end-to-end folding runs.
 
 ## Deployment and current status
 
