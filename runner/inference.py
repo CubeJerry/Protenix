@@ -497,6 +497,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         t1_start = time.time()
         for batch in dataloader:
             sample_name = "unknown"
+            prediction = None
             try:
                 t2_start = time.time()
                 data, atom_array, data_error_message = batch[0]
@@ -533,6 +534,9 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         if v != "non-polymer"
                     },
                 )
+                # The synchronous dumper has finished; do not retain GPU outputs
+                # through the next seed/item's forward pass.
+                del prediction
                 t2_end = time.time()
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample_name} [seed:{seed}] succeeded. "
@@ -552,6 +556,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     encoding="utf-8",
                 ) as f:
                     f.write(error_message)
+                prediction = None
                 torch.cuda.empty_cache()
         t1_end = time.time()
         logger.info(
