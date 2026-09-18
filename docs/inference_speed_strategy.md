@@ -23,7 +23,7 @@ The initial audit compared kit commit `f4f62fa6592ae4938d49b1757bea0cfeff9f468e`
 fork commit `c5f0d8eb89923aebf03f4d56de2eab2ac3313e61`, and pipeline commit
 `1d2314dcd5e61697a1172bd7abb981502a5e6e72`.
 
-## Stage 1: minimal overhead changes (this patch)
+## Stage 1: minimal overhead changes
 
 1. Release the prediction dictionary after the synchronous dumper finishes,
    before the existing per-item allocator flush. Release the loop's reference on
@@ -55,18 +55,71 @@ These checks establish control-flow behaviour, not numerical/GPU equivalence.
 | Reuse identical template calculations | Template embedder, scoped to one call and current pair representation | Compare complete feature slices; preserve addition order and all chain mappings |
 | Reuse MSA pair weights across chunks | MSA block, only while its pair input remains unchanged | First establish that actual VHH MSA depth spans chunks; test output equality |
 
-For compilation caches, use an architecture/software/source-keyed, per-user cache.
-Avoid many array workers compiling into one fresh shared directory. Prefer a
-prewarmed immutable cache copied to task-local writable storage, or verified
-concurrency-safe cache sharing. Include Torch/CUDA/Triton/cuEquivariance versions,
-GPU architecture and relevant kernel source version in its identity. Do not
-enable kernel autotuning or change kernel selection as part of cache reuse.
-Time cache copying too: it must save more than it costs.
+Stage 2 is implemented behind independent opt-in switches (all default to `0`):
 
-Keep initialization zero/one constants and nonpersistent buffers intact. Reject
-the optimization for partial/non-strict checkpoint loads. Model reuse across
-candidates is a later option only if profiling shows construction is a material
-cost; it would require deliberate config/cache reset and changes to job ownership.
+```bash
+export PROTENIX_SKIP_RANDOM_INIT=1
+export PROTENIX_REUSE_TEMPLATES=1
+export PROTENIX_REUSE_MSA_PAIR_WEIGHTS=1
+```
+
+The runner logs these settings and rejects values other than `0`/`1`.
+Initialization skipping is scoped to construction of this model's linear layers;
+it never patches PyTorch globally. Zero/one constants and nonpersistent buffers
+retain their initialization. Non-strict checkpoint loading is rejected. The
+normal runner reseeds after checkpoint loading and before stochastic inference;
+custom callers must do the same. Missing checkpoint parameters still fail the
+existing strict load. This is selective skipping, not uninitialized construction
+of every module, and does not alter checkpoint keys or parameter shapes.
+
+Template reuse compares all five template feature slices and the fork's optional
+per-template geometry mask. Only exact duplicates share a computation, only in
+eval mode with gradients disabled, and only within one forward call. Every
+original slot contributes in its original order. Only outputs needed by later
+duplicates are retained, and each is released after its final use. Equality
+checks may synchronize a GPU, so workloads without duplicate templates may not
+benefit; measure this switch separately.
+
+MSA pair-weight reuse computes the same normalization, projection and softmax
+once per MSA stack call when multiple chunks share z. It preserves all MSA rows,
+chunk boundaries and downstream operations. Single-chunk, training and gradient
+paths retain their original calculation. Nothing is cached across recycles,
+candidates or seeds. GPU peak memory remains a required validation item.
+
+The companion pipeline patch supports persistent **native Triton/CUDA caches**:
+
+```bash
+export NOMINEE_PROTENIX_JIT_CACHE_ROOT=/persistent/user-writable/protenix-jit
+export NOMINEE_PROTENIX_JIT_CACHE_NAMESPACE=imageDigest-forkCommit-a100-driverVersion
+```
+
+Use an actual pinned image/fork/GPU/driver identifier in the namespace, and change
+it whenever any of those changes. The image identity must capture Torch, CUDA,
+Triton and cuEquivariance versions. Paths are separated by numeric user ID and
+namespace; existing `TRITON_CACHE_DIR` and `CUDA_CACHE_PATH` overrides win. No
+persistent root means the existing task-local policy. Unavailable persistent
+directories fall back to task-local caches. A missing/unsafe namespace is a
+configuration error. Native backends remain responsible for their cache keys
+and writes; this does not enable new kernels, compilation modes or autotuning.
+No cache files are copied or rewritten, avoiding path-dependent cache manifests.
+
+Prewarm with one job before launching an array. Verify native backend concurrent
+writes on the actual cluster filesystem before broad use; CPU tests exercise
+path selection, namespaces, overrides and unavailable-path fallback only. Cache
+capacity/exhaustion, driver compatibility and cold/warm GPU timings remain
+unverified. This is an opt-in deployment facility, not an assertion that every
+backend or filesystem has already passed concurrency testing.
+
+Validation: CPU tests run the actual MSA/template modules with nonzero randomized
+parameters and compare outputs with `torch.equal`, check projection/template call
+counts, distinct geometry/features, changed pair inputs, training/gradient guards,
+strict loading of representative linear modules, initialization scope isolation,
+and nonpersistent constant buffers. They do not validate the full checkpoint or
+end-to-end folding. The stage-1 memory-lifetime tests continue to pass.
+
+Model reuse across candidates remains a later option only if profiling shows
+construction is a material cost; it requires config/cache reset and different
+job ownership.
 
 ## Stage 3: integrate Exact execution on the fork
 
@@ -168,7 +221,8 @@ an immutable installation requires rebuilding or repinning the Protenix componen
 image containing these source files, then running its existing GPU smoke test.
 The audited pipeline recipe points to a separate source URL/pin: confirm the image
 actually consumes this fork's changes before claiming deployment. No core-image
-rebuild is intrinsically required by these two edits.
+rebuild is intrinsically required by these source edits.
 
 No GPU benchmark, folding-equivalence claim, runtime speedup, production deployment
-or merge is established by the CPU checks. Stages 2-4 remain planned work.
+or merge is established by the CPU checks. Stage 2 is implemented but opt-in;
+stages 3-4 remain planned work.

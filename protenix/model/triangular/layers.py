@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.stats import truncnorm
+from protenix.model.inference_optimization import CheckpointLinear, skipping_random_init
 
 from protenix.model.utils import (
     chunk_layer,
@@ -62,6 +63,8 @@ def _calculate_fan(
 def trunc_normal_init_(
     weights: torch.Tensor, scale: float = 1.0, fan: str = "fan_in"
 ) -> None:
+    if skipping_random_init():
+        return
     shape = weights.shape
     f = _calculate_fan(shape, fan)
     scale = scale / max(1, f)
@@ -84,7 +87,8 @@ def he_normal_init_(weights: torch.Tensor) -> None:
 
 
 def glorot_uniform_init_(weights: torch.Tensor) -> None:
-    nn.init.xavier_uniform_(weights, gain=1)
+    if not skipping_random_init():
+        nn.init.xavier_uniform_(weights, gain=1)
 
 
 def final_init_(weights: torch.Tensor) -> None:
@@ -98,10 +102,11 @@ def gating_init_(weights: torch.Tensor) -> None:
 
 
 def normal_init_(weights: torch.Tensor) -> None:
-    torch.nn.init.kaiming_normal_(weights, nonlinearity="linear")
+    if not skipping_random_init():
+        torch.nn.init.kaiming_normal_(weights, nonlinearity="linear")
 
 
-class OpenfoldLinear(nn.Linear):
+class OpenfoldLinear(CheckpointLinear):
     """
     A Linear layer with built-in nonstandard initializations. Called just
     like torch.nn.Linear.

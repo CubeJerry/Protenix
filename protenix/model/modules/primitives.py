@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from protenix.model.inference_optimization import CheckpointLinear
 from protenix.model.triangular.layers import LayerNorm, trunc_normal_init_
 from protenix.model.utils import (
     chunk_layer,
@@ -30,7 +31,7 @@ from protenix.model.utils import (
 )
 
 
-class Linear(nn.Linear):
+class Linear(CheckpointLinear):
     """Linear module with customized initialization.
 
     Args:
